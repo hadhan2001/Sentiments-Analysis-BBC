@@ -1,0 +1,731 @@
+"""
+BBC Persian Afghanistan scraper - version V3
+
+Plateforme recommandée : VS Code sous Windows
+Exécution :
+    python scraper_bbc_afghanistan_v3.py
+
+Cette version :
+- essaie l'ancienne rubrique et la page thématique Afghanistan ;
+- parcourt directement les pages 1 à 10 avec ?page=N ;
+- récupère les liens depuis le DOM Selenium rendu ;
+- accepte bbc.com et bbc.co.uk ;
+- sauvegarde une capture et le HTML si aucune URL n'est détectée ;
+- extrait les articles dans un CSV UTF-8-SIG.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import time
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urljoin, urlparse
+
+import pandas as pd
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.common.exceptions import TimeoutException, WebDriverException
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.remote.webdriver import WebDriver
+from selenium.webdriver.support.ui import WebDriverWait
+
+
+# ============================================================
+# RÉGLAGES
+# ============================================================
+
+CATEGORY_URLS = [
+    "https://www.bbc.com/persian/afghanistan",
+    "https://www.bbc.com/persian/topics/c7q68p5epzzt",
+]
+
+MAX_PAGES = 10
+HEADLESS = False
+
+OUTPUT_DIR = Path("data")
+DEBUG_DIR = Path("debug_bbc")
+OUTPUT_CSV = OUTPUT_DIR / "bbc_persian_afghanistan.csv"
+
+WAIT_SECONDS = 25
+DELAY_BETWEEN_PAGES = 1.5
+DELAY_BETWEEN_ARTICLES = 1.2
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/150.0.0.0 Safari/537.36"
+)
+
+
+# ============================================================
+# OUTILS
+# ============================================================
+
+def clean_text(text: str | None) -> str:
+    if not text:
+        return ""
+
+    text = text.replace("\xa0", " ")
+    text = re.sub(r"[\t\r\f\v]+", " ", text)
+    text = re.sub(r" +", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+    return text.strip()
+
+
+def create_driver() -> WebDriver:
+    options = Options()
+
+    if HEADLESS:
+        options.add_argument("--headless=new")
+
+    options.add_argument("--window-size=1440,1200")
+    options.add_argument("--lang=fa")
+    options.add_argument(f"--user-agent={USER_AGENT}")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--no-sandbox")
+
+    driver = webdriver.Chrome(options=options)
+    driver.set_page_load_timeout(60)
+    return driver
+
+
+def wait_page_ready(driver: WebDriver) -> None:
+    WebDriverWait(driver, WAIT_SECONDS).until(
+        lambda browser: browser.execute_script(
+            "return document.readyState"
+        ) == "complete"
+    )
+
+
+def scroll_page(driver: WebDriver) -> None:
+    previous_height = 0
+
+    for _ in range(8):
+        try:
+            current_height = driver.execute_script(
+                "return document.body.scrollHeight"
+            )
+
+            driver.execute_script(
+                "window.scrollTo(0, document.body.scrollHeight);"
+            )
+            time.sleep(0.7)
+
+            if current_height == previous_height:
+                break
+
+            previous_height = current_height
+
+        except WebDriverException:
+            break
+
+
+def build_page_url(base_url: str, page_number: int) -> str:
+    """
+    Les pages thématiques BBC utilisent généralement ?page=N.
+    Pour la page 1, on conserve l'URL sans paramètre.
+    """
+    if page_number == 1:
+        return base_url
+
+    separator = "&" if "?" in base_url else "?"
+    return f"{base_url}{separator}page={page_number}"
+
+
+def normalize_url(url: str, current_url: str) -> str:
+    absolute = urljoin(current_url, url)
+    parsed = urlparse(absolute)
+
+    return parsed._replace(
+        query="",
+        fragment="",
+    ).geturl().rstrip("/")
+
+
+def is_persian_article_url(url: str) -> bool:
+    """
+    Filtre volontairement plus souple que dans la version précédente.
+
+    Formats acceptés :
+    - /persian/articles/...
+    - anciennes pages /persian/quelque-chose-12345678
+    """
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+
+    path = parsed.path.rstrip("/")
+
+    if "/persian/articles/" in path:
+        return True
+
+    if re.search(r"^/persian/[A-Za-z0-9_-]+-\d{6,}$", path):
+        return True
+
+    return False
+
+
+def extract_links_from_rendered_dom(driver: WebDriver) -> set[str]:
+    """
+    Récupère directement les href depuis le DOM rendu par Chrome.
+    Cette méthode est plus fiable que l'analyse du HTML initial.
+    """
+    raw_links = driver.execute_script(
+        """
+        return Array.from(document.querySelectorAll('a[href]'))
+            .map(a => a.href)
+            .filter(Boolean);
+        """
+    )
+
+    links: set[str] = set()
+
+    for raw_url in raw_links or []:
+        url = normalize_url(str(raw_url), driver.current_url)
+
+        if is_persian_article_url(url):
+            links.add(url)
+
+    return links
+
+
+def save_debug_files(
+    driver: WebDriver,
+    label: str,
+) -> None:
+    """
+    Sauvegarde une capture et le HTML lorsque BBC ne fournit aucun article.
+    """
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+
+    safe_label = re.sub(r"[^A-Za-z0-9_-]+", "_", label)
+    html_path = DEBUG_DIR / f"{safe_label}.html"
+    screenshot_path = DEBUG_DIR / f"{safe_label}.png"
+
+    html_path.write_text(
+        driver.page_source,
+        encoding="utf-8",
+    )
+
+    try:
+        driver.save_screenshot(str(screenshot_path))
+    except WebDriverException:
+        pass
+
+    print(f"    Diagnostic HTML : {html_path.resolve()}")
+    print(f"    Capture écran   : {screenshot_path.resolve()}")
+
+
+# ============================================================
+# COLLECTE DES LIENS
+# ============================================================
+
+def test_category_url(
+    driver: WebDriver,
+    base_url: str,
+) -> tuple[str, set[str]]:
+    """
+    Essaie une URL de rubrique et retourne les premiers liens détectés.
+    """
+    print(f"\nTest de la rubrique : {base_url}")
+
+    driver.get(base_url)
+    wait_page_ready(driver)
+    time.sleep(2)
+    scroll_page(driver)
+
+    print(f"    URL finale : {driver.current_url}")
+    print(f"    Titre      : {driver.title}")
+
+    links = extract_links_from_rendered_dom(driver)
+    print(f"    Articles détectés : {len(links)}")
+
+    return driver.current_url, links
+
+
+def find_working_category(
+    driver: WebDriver,
+) -> tuple[str, set[str]]:
+    """
+    Essaie les deux formes d'adresse et conserve celle qui fournit des articles.
+    """
+    for base_url in CATEGORY_URLS:
+        try:
+            final_url, links = test_category_url(
+                driver,
+                base_url,
+            )
+
+            if links:
+                return final_url.split("?")[0], links
+
+            save_debug_files(
+                driver,
+                "rubrique_sans_articles",
+            )
+
+        except Exception as error:
+            print(
+                f"    Échec : {type(error).__name__}: {error}"
+            )
+
+    raise RuntimeError(
+        "Aucune des adresses de rubrique n'a fourni d'articles. "
+        "Consulte le dossier debug_bbc pour voir la page réellement affichée."
+    )
+
+
+def collect_article_links(
+    driver: WebDriver,
+) -> list[str]:
+    """
+    Parcourt jusqu'à 10 pages de la rubrique et récupère les URL uniques.
+    """
+    base_url, first_page_links = find_working_category(driver)
+
+    all_links: set[str] = set(first_page_links)
+
+    print(f"\nRubrique retenue : {base_url}")
+
+    for page_number in range(1, MAX_PAGES + 1):
+        page_url = build_page_url(
+            base_url,
+            page_number,
+        )
+
+        try:
+            print(
+                f"\nPage {page_number}/{MAX_PAGES} : "
+                f"{page_url}"
+            )
+
+            driver.get(page_url)
+            wait_page_ready(driver)
+            time.sleep(1.5)
+            scroll_page(driver)
+
+            page_links = extract_links_from_rendered_dom(driver)
+            before = len(all_links)
+            all_links.update(page_links)
+            added = len(all_links) - before
+
+            print(f"    URL finale       : {driver.current_url}")
+            print(f"    Liens sur la page: {len(page_links)}")
+            print(f"    Nouveaux liens   : {added}")
+            print(f"    Total unique     : {len(all_links)}")
+
+            if not page_links:
+                save_debug_files(
+                    driver,
+                    f"page_{page_number}_sans_articles",
+                )
+
+            # Si une page supérieure à 1 ne contient aucun nouvel article,
+            # il est probable qu'on ait atteint la dernière page.
+            if page_number > 1 and not page_links:
+                print(
+                    "    Arrêt : cette page ne contient aucun article."
+                )
+                break
+
+            time.sleep(DELAY_BETWEEN_PAGES)
+
+        except TimeoutException:
+            print("    Délai de chargement dépassé.")
+            save_debug_files(
+                driver,
+                f"page_{page_number}_timeout",
+            )
+
+        except WebDriverException as error:
+            print(
+                f"    Erreur Selenium : {error}"
+            )
+            save_debug_files(
+                driver,
+                f"page_{page_number}_erreur",
+            )
+
+    return sorted(all_links)
+
+
+# ============================================================
+# EXTRACTION D'ARTICLE
+# ============================================================
+
+def find_json_ld_article(
+    soup: BeautifulSoup,
+) -> dict:
+    scripts = soup.find_all(
+        "script",
+        attrs={"type": "application/ld+json"},
+    )
+
+    objects: list[object] = []
+
+    for script in scripts:
+        raw = script.string or script.get_text()
+
+        if not raw.strip():
+            continue
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+
+        objects.append(parsed)
+
+    while objects:
+        current = objects.pop(0)
+
+        if isinstance(current, list):
+            objects.extend(current)
+            continue
+
+        if not isinstance(current, dict):
+            continue
+
+        current_type = current.get("@type", [])
+        types = current_type if isinstance(
+            current_type,
+            list,
+        ) else [current_type]
+
+        if any(
+            item in {
+                "Article",
+                "NewsArticle",
+                "ReportageNewsArticle",
+            }
+            for item in types
+        ):
+            return current
+
+        for value in current.values():
+            if isinstance(value, (dict, list)):
+                objects.append(value)
+
+    return {}
+
+
+def meta_content(
+    soup: BeautifulSoup,
+    attribute: str,
+    value: str,
+) -> str:
+    tag = soup.find(
+        "meta",
+        attrs={attribute: value},
+    )
+
+    if tag and tag.get("content"):
+        return clean_text(str(tag["content"]))
+
+    return ""
+
+
+def extract_author(
+    json_ld: dict,
+    soup: BeautifulSoup,
+) -> str:
+    author = json_ld.get("author")
+
+    if isinstance(author, str):
+        return clean_text(author)
+
+    if isinstance(author, dict):
+        return clean_text(
+            str(author.get("name", ""))
+        )
+
+    if isinstance(author, list):
+        names: list[str] = []
+
+        for item in author:
+            if isinstance(item, str):
+                names.append(item)
+
+            elif isinstance(item, dict):
+                name = item.get("name")
+
+                if name:
+                    names.append(str(name))
+
+        return clean_text(", ".join(names))
+
+    for selector in (
+        "[data-testid='byline-name']",
+        "[rel='author']",
+        ".byline__name",
+    ):
+        element = soup.select_one(selector)
+
+        if element:
+            return clean_text(
+                element.get_text(" ", strip=True)
+            )
+
+    return ""
+
+
+def extract_text(
+    json_ld: dict,
+    soup: BeautifulSoup,
+) -> str:
+    article_body = json_ld.get("articleBody")
+
+    if (
+        isinstance(article_body, str)
+        and len(article_body.strip()) > 100
+    ):
+        return clean_text(article_body)
+
+    article = soup.find("article")
+    main = soup.find("main")
+    root = article or main or soup
+
+    paragraphs: list[str] = []
+    seen: set[str] = set()
+
+    ignored = (
+        "برای مشاهده این محتوا",
+        "برای دیدن این محتوا",
+        "javascript",
+        "facebook",
+        "instagram",
+        "whatsapp",
+        "تلگرام بی‌بی‌سی",
+    )
+
+    for paragraph in root.find_all("p"):
+        if paragraph.find_parent(
+            ["nav", "footer", "aside", "figure"]
+        ):
+            continue
+
+        text = clean_text(
+            paragraph.get_text(" ", strip=True)
+        )
+
+        if len(text) < 20:
+            continue
+
+        lowered = text.casefold()
+
+        if any(
+            phrase.casefold() in lowered
+            for phrase in ignored
+        ):
+            continue
+
+        if text not in seen:
+            seen.add(text)
+            paragraphs.append(text)
+
+    return "\n".join(paragraphs)
+
+
+def scrape_article(
+    driver: WebDriver,
+    url: str,
+    index: int,
+    total: int,
+) -> dict:
+    print(f"[{index}/{total}] {url}")
+
+    driver.get(url)
+    wait_page_ready(driver)
+    time.sleep(1)
+
+    soup = BeautifulSoup(
+        driver.page_source,
+        "lxml",
+    )
+    json_ld = find_json_ld_article(soup)
+
+    title = clean_text(
+        str(json_ld.get("headline", ""))
+    )
+
+    if not title:
+        title = meta_content(
+            soup,
+            "property",
+            "og:title",
+        )
+
+    if not title:
+        h1 = soup.find("h1")
+
+        if h1:
+            title = clean_text(
+                h1.get_text(" ", strip=True)
+            )
+
+    description = clean_text(
+        str(json_ld.get("description", ""))
+    )
+
+    if not description:
+        description = meta_content(
+            soup,
+            "name",
+            "description",
+        )
+
+    date_published = clean_text(
+        str(json_ld.get("datePublished", ""))
+    )
+    date_modified = clean_text(
+        str(json_ld.get("dateModified", ""))
+    )
+
+    if not date_published:
+        time_tag = soup.find("time")
+
+        if time_tag:
+            date_published = clean_text(
+                str(
+                    time_tag.get("datetime")
+                    or time_tag.get_text(
+                        " ",
+                        strip=True,
+                    )
+                )
+            )
+
+    author = extract_author(
+        json_ld,
+        soup,
+    )
+    text = extract_text(
+        json_ld,
+        soup,
+    )
+
+    return {
+        "url": url,
+        "title": title,
+        "description": description,
+        "author": author,
+        "date_published": date_published,
+        "date_modified": date_modified,
+        "text": text,
+        "word_count": len(text.split()),
+        "scraped_at": datetime.now().isoformat(
+            timespec="seconds"
+        ),
+    }
+
+
+# ============================================================
+# ENREGISTREMENT
+# ============================================================
+
+def save_csv(
+    records: list[dict],
+) -> None:
+    OUTPUT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    dataframe = pd.DataFrame(records)
+
+    dataframe.to_csv(
+        OUTPUT_CSV,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    print(
+        f"\nCSV sauvegardé : {OUTPUT_CSV.resolve()}"
+    )
+
+
+# ============================================================
+# PROGRAMME PRINCIPAL
+# ============================================================
+
+def main() -> None:
+    driver: WebDriver | None = None
+    records: list[dict] = []
+
+    try:
+        driver = create_driver()
+
+        article_links = collect_article_links(
+            driver
+        )
+
+        print(
+            f"\nNombre total d'articles uniques : "
+            f"{len(article_links)}"
+        )
+
+        if not article_links:
+            print(
+                "\nAucun lien trouvé. Ouvre les fichiers du "
+                "dossier debug_bbc pour vérifier si BBC affiche "
+                "une page de consentement, une erreur ou une redirection."
+            )
+            return
+
+        for index, url in enumerate(
+            article_links,
+            start=1,
+        ):
+            try:
+                record = scrape_article(
+                    driver,
+                    url,
+                    index,
+                    len(article_links),
+                )
+                records.append(record)
+
+                print(
+                    f"    OK : {record['word_count']} mot(s) - "
+                    f"{record['title'][:80]}"
+                )
+
+            except Exception as error:
+                print(
+                    f"    Article ignoré : "
+                    f"{type(error).__name__}: {error}"
+                )
+
+            if records and index % 10 == 0:
+                save_csv(records)
+
+            time.sleep(
+                DELAY_BETWEEN_ARTICLES
+            )
+
+        if records:
+            save_csv(records)
+
+            print(
+                f"\nTerminé : {len(records)} "
+                f"article(s) enregistré(s)."
+            )
+
+    except Exception as error:
+        print(
+            f"\nERREUR PRINCIPALE : "
+            f"{type(error).__name__}: {error}"
+        )
+
+    finally:
+        if driver is not None:
+            driver.quit()
+
+
+if __name__ == "__main__":
+    main()

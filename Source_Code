@@ -1,18 +1,3 @@
-"""
-BBC Persian Afghanistan scraper - version V3
-
-Plateforme recommandée : VS Code sous Windows
-Exécution :
-    python scraper_bbc_afghanistan_v3.py
-
-Cette version :
-- essaie l'ancienne rubrique et la page thématique Afghanistan ;
-- parcourt directement les pages 1 à 10 avec ?page=N ;
-- récupère les liens depuis le DOM Selenium rendu ;
-- accepte bbc.com et bbc.co.uk ;
-- sauvegarde une capture et le HTML si aucune URL n'est détectée ;
-- extrait les articles dans un CSV UTF-8-SIG.
-"""
 
 from __future__ import annotations
 
@@ -32,16 +17,16 @@ from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.webdriver.support.ui import WebDriverWait
 
 
-# ============================================================
+
 # RÉGLAGES
-# ============================================================
+
 
 CATEGORY_URLS = [
     "https://www.bbc.com/persian/afghanistan",
     "https://www.bbc.com/persian/topics/c7q68p5epzzt",
 ]
 
-MAX_PAGES = 10
+MAX_PAGES = 10 #Récupere les 10 premières pages
 HEADLESS = False
 
 OUTPUT_DIR = Path("data")
@@ -55,13 +40,13 @@ DELAY_BETWEEN_ARTICLES = 1.2
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/150.0.0.0 Safari/537.36"
+    "Chrome/150.0.0.0 Safari/537.36" #Simulation d'un navigateur pour Selenium
 )
 
 
-# ============================================================
+
 # OUTILS
-# ============================================================
+# Utilisation de REGEX pour nettoyer les données
 
 def clean_text(text: str | None) -> str:
     if not text:
@@ -73,7 +58,7 @@ def clean_text(text: str | None) -> str:
     text = re.sub(r"\n\s*\n+", "\n", text)
     return text.strip()
 
-
+#Paramètres du pilote 
 def create_driver() -> WebDriver:
     options = Options()
 
@@ -147,9 +132,8 @@ def normalize_url(url: str, current_url: str) -> str:
 
 
 def is_persian_article_url(url: str) -> bool:
-    """
-    Filtre volontairement plus souple que dans la version précédente.
 
+    """
     Formats acceptés :
     - /persian/articles/...
     - anciennes pages /persian/quelque-chose-12345678
@@ -173,7 +157,6 @@ def is_persian_article_url(url: str) -> bool:
 def extract_links_from_rendered_dom(driver: WebDriver) -> set[str]:
     """
     Récupère directement les href depuis le DOM rendu par Chrome.
-    Cette méthode est plus fiable que l'analyse du HTML initial.
     """
     raw_links = driver.execute_script(
         """
@@ -221,9 +204,9 @@ def save_debug_files(
     print(f"    Capture écran   : {screenshot_path.resolve()}")
 
 
-# ============================================================
+
 # COLLECTE DES LIENS
-# ============================================================
+
 
 def test_category_url(
     driver: WebDriver,
@@ -354,9 +337,9 @@ def collect_article_links(
     return sorted(all_links)
 
 
-# ============================================================
+
 # EXTRACTION D'ARTICLE
-# ============================================================
+
 
 def find_json_ld_article(
     soup: BeautifulSoup,
@@ -624,9 +607,9 @@ def scrape_article(
     }
 
 
-# ============================================================
+
 # ENREGISTREMENT
-# ============================================================
+# Fichier csv
 
 def save_csv(
     records: list[dict],
@@ -649,9 +632,8 @@ def save_csv(
     )
 
 
-# ============================================================
+
 # PROGRAMME PRINCIPAL
-# ============================================================
 
 def main() -> None:
     driver: WebDriver | None = None

@@ -1,0 +1,412 @@
+from __future__ import annotations
+
+import math
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+import torch
+from tqdm import tqdm
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+
+
+# RÉGLAGES
+
+
+MODEL_NAME = (
+    "HooshvareLab/"
+    "bert-fa-base-uncased-sentiment-deepsentipers-binary"
+)
+
+INPUT_CSV = Path("data/bbc_persian_afghanistan.csv")
+OUTPUT_CSV = Path("data/bbc_persian_afghanistan_sentiments.csv")
+SUMMARY_CSV = Path("data/bbc_persian_afghanistan_sentiment_summary.csv")
+
+TEXT_COLUMNS = ("title", "description", "text")
+
+MAX_LENGTH = 512
+STRIDE = 64
+CPU_BATCH_SIZE = 2
+GPU_BATCH_SIZE = 8
+MINIMUM_CHARACTERS = 20
+SAVE_EVERY = 5
+
+
+
+# NETTOYAGE
+
+
+def normalize_persian_text(value: Any) -> str:
+    """Nettoie le texte et homogénéise quelques variantes arabes/persanes."""
+    if value is None:
+        return ""
+
+    try:
+        if pd.isna(value):
+            return ""
+    except (TypeError, ValueError):
+        pass
+
+    text = str(value)
+    text = text.replace("ي", "ی")
+    text = text.replace("ى", "ی")
+    text = text.replace("ك", "ک")
+    text = text.replace("ۀ", "هٔ")
+    text = text.replace("\u200e", "")
+    text = text.replace("\u200f", "")
+    text = text.replace("\ufeff", "")
+
+    text = re.sub(r"https?://\S+", " ", text)
+    text = re.sub(r"www\.\S+", " ", text)
+    text = re.sub(r"[\t\r\f\v]+", " ", text)
+    text = re.sub(r" +", " ", text)
+    text = re.sub(r"\n\s*\n+", "\n", text)
+
+    return text.strip()
+
+
+def build_article_text(row: pd.Series) -> str:
+    """Réunit le titre, la description et le corps sans doublons exacts."""
+    parts: list[str] = []
+    seen: set[str] = set()
+
+    for column in TEXT_COLUMNS:
+        if column not in row.index:
+            continue
+
+        text = normalize_persian_text(row[column])
+        if not text:
+            continue
+
+        key = re.sub(r"\s+", " ", text).casefold()
+        if key not in seen:
+            seen.add(key)
+            parts.append(text)
+
+    return "\n\n".join(parts)
+
+
+
+# MODÈLE
+# =========================
+
+def choose_device() -> torch.device:
+    """Utilise le GPU NVIDIA """
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def find_label_indexes(model) -> tuple[int, int]:
+    """Retrouve les indices des classes negative et positive."""
+    label2id = {
+        str(label).casefold(): int(index)
+        for label, index in model.config.label2id.items()
+    }
+
+    negative_index = label2id.get("negative")
+    positive_index = label2id.get("positive")
+
+    if negative_index is None or positive_index is None:
+        id2label = {
+            int(index): str(label).casefold()
+            for index, label in model.config.id2label.items()
+        }
+        for index, label in id2label.items():
+            if label == "negative":
+                negative_index = index
+            elif label == "positive":
+                positive_index = index
+
+    if negative_index is None or positive_index is None:
+        raise RuntimeError(
+            "Impossible de retrouver les classes positive et negative."
+        )
+
+    return negative_index, positive_index
+
+
+def load_model():
+    """Télécharge le modèle au premier lancement"""
+    print(f"Chargement du tokenizer : {MODEL_NAME}")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+    print(f"Chargement du modèle : {MODEL_NAME}")
+    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+
+    device = choose_device()
+    model.to(device)
+    model.eval()
+
+    negative_index, positive_index = find_label_indexes(model)
+
+    print(f"Appareil utilisé : {device}")
+    print(
+        "Classes détectées : "
+        f"negative={negative_index}, positive={positive_index}"
+    )
+
+    return tokenizer, model, device, negative_index, positive_index
+
+
+
+# ANALYSE D'UN ARTICLE LONG
+
+
+def tokenize_into_chunks(text: str, tokenizer) -> dict[str, torch.Tensor]:
+    """Découpe automatiquement un article en séquences de 512 jetons."""
+    encoded = tokenizer(
+        text,
+        add_special_tokens=True,
+        truncation=True,
+        max_length=MAX_LENGTH,
+        stride=STRIDE,
+        return_overflowing_tokens=True,
+        padding="max_length",
+        return_attention_mask=True,
+        return_tensors="pt",
+    )
+
+    encoded.pop("overflow_to_sample_mapping", None)
+    allowed_keys = {"input_ids", "attention_mask", "token_type_ids"}
+
+    return {
+        key: value
+        for key, value in encoded.items()
+        if key in allowed_keys
+    }
+
+
+def analyze_long_text(
+    text: str,
+    tokenizer,
+    model,
+    device: torch.device,
+    negative_index: int,
+    positive_index: int,
+) -> dict[str, Any]:
+    """
+    Analyse tous les morceaux et calcule une moyenne pondérée par le nombre
+    de vrais jetons de chaque morceau.
+    """
+    encoded = tokenize_into_chunks(text, tokenizer)
+    number_of_chunks = int(encoded["input_ids"].shape[0])
+
+    if number_of_chunks == 0:
+        raise RuntimeError("Le tokenizer n'a produit aucun morceau.")
+
+    batch_size = GPU_BATCH_SIZE if device.type == "cuda" else CPU_BATCH_SIZE
+
+    weighted_sum = torch.zeros(
+        model.config.num_labels,
+        dtype=torch.float64,
+    )
+    total_weight = 0.0
+
+    with torch.inference_mode():
+        for start in range(0, number_of_chunks, batch_size):
+            end = min(start + batch_size, number_of_chunks)
+
+            batch = {
+                key: value[start:end].to(device)
+                for key, value in encoded.items()
+            }
+
+            outputs = model(**batch)
+            probabilities = torch.softmax(
+                outputs.logits,
+                dim=-1,
+            ).detach().cpu().to(torch.float64)
+
+            weights = (
+                batch["attention_mask"]
+                .sum(dim=1)
+                .detach()
+                .cpu()
+                .to(torch.float64)
+            )
+
+            weighted_sum += (
+                probabilities * weights.unsqueeze(1)
+            ).sum(dim=0)
+            total_weight += float(weights.sum().item())
+
+    if total_weight <= 0:
+        raise RuntimeError("Le poids total des morceaux est nul.")
+
+    article_probabilities = weighted_sum / total_weight
+
+    negative_probability = float(
+        article_probabilities[negative_index].item()
+    )
+    positive_probability = float(
+        article_probabilities[positive_index].item()
+    )
+
+    if positive_probability >= negative_probability:
+        sentiment = "positif"
+        confidence = positive_probability
+    else:
+        sentiment = "négatif"
+        confidence = negative_probability
+
+    return {
+        "sentiment": sentiment,
+        "sentiment_confidence": confidence,
+        "positive_probability": positive_probability,
+        "negative_probability": negative_probability,
+        "polarity_score": positive_probability - negative_probability,
+        "sentiment_chunks": number_of_chunks,
+    }
+
+
+
+# CSV
+
+def validate_input(dataframe: pd.DataFrame) -> None:
+    available = [
+        column for column in TEXT_COLUMNS
+        if column in dataframe.columns
+    ]
+    if not available:
+        raise ValueError(
+            "Le CSV ne contient aucune des colonnes attendues : "
+            f"{', '.join(TEXT_COLUMNS)}."
+        )
+
+
+def save_results(dataframe: pd.DataFrame) -> None:
+    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    dataframe.to_csv(
+        OUTPUT_CSV,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+
+def create_summary(dataframe: pd.DataFrame) -> None:
+    valid_rows = dataframe[
+        dataframe["sentiment"].isin(["positif", "négatif"])
+    ].copy()
+
+    if valid_rows.empty:
+        return
+
+    summary = (
+        valid_rows
+        .groupby("sentiment", as_index=False)
+        .agg(
+            article_count=("sentiment", "size"),
+            mean_confidence=("sentiment_confidence", "mean"),
+            mean_polarity_score=("polarity_score", "mean"),
+        )
+    )
+
+    total = int(summary["article_count"].sum())
+    summary["percentage"] = summary["article_count"] / total * 100
+
+    summary.to_csv(
+        SUMMARY_CSV,
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+
+def main() -> None:
+    if not INPUT_CSV.exists():
+        raise FileNotFoundError(
+            f"CSV introuvable : {INPUT_CSV.resolve()}\n"
+            "Place ce programme dans le même dossier que le scraper, "
+            "ou modifie INPUT_CSV au début du fichier."
+        )
+
+    print(f"Lecture du CSV : {INPUT_CSV.resolve()}")
+    dataframe = pd.read_csv(INPUT_CSV, encoding="utf-8-sig")
+    validate_input(dataframe)
+
+    result_columns = {
+        "sentiment": "",
+        "sentiment_confidence": math.nan,
+        "positive_probability": math.nan,
+        "negative_probability": math.nan,
+        "polarity_score": math.nan,
+        "sentiment_chunks": 0,
+        "sentiment_text_characters": 0,
+        "sentiment_model": MODEL_NAME,
+        "sentiment_analyzed_at": "",
+        "sentiment_error": "",
+    }
+
+    for column, default_value in result_columns.items():
+        if column not in dataframe.columns:
+            dataframe[column] = default_value
+
+    tokenizer, model, device, negative_index, positive_index = load_model()
+
+    print(f"\nAnalyse de {len(dataframe)} article(s)...\n")
+
+    for position in tqdm(
+        range(len(dataframe)),
+        desc="Articles",
+        unit="article",
+    ):
+        row = dataframe.iloc[position]
+        article_text = build_article_text(row)
+        index = dataframe.index[position]
+
+        dataframe.at[index, "sentiment_text_characters"] = len(article_text)
+        dataframe.at[index, "sentiment_model"] = MODEL_NAME
+        dataframe.at[index, "sentiment_analyzed_at"] = (
+            datetime.now().isoformat(timespec="seconds")
+        )
+
+        if len(article_text) < MINIMUM_CHARACTERS:
+            dataframe.at[index, "sentiment"] = "texte_insuffisant"
+            dataframe.at[index, "sentiment_error"] = (
+                "Le texte est vide ou trop court."
+            )
+            continue
+
+        try:
+            result = analyze_long_text(
+                text=article_text,
+                tokenizer=tokenizer,
+                model=model,
+                device=device,
+                negative_index=negative_index,
+                positive_index=positive_index,
+            )
+
+            for column, value in result.items():
+                dataframe.at[index, column] = value
+
+            dataframe.at[index, "sentiment_error"] = ""
+
+        except Exception as error:
+            dataframe.at[index, "sentiment"] = "erreur"
+            dataframe.at[index, "sentiment_error"] = (
+                f"{type(error).__name__}: {error}"
+            )
+
+        if (
+            (position + 1) % SAVE_EVERY == 0
+            or position == len(dataframe) - 1
+        ):
+            save_results(dataframe)
+
+    save_results(dataframe)
+    create_summary(dataframe)
+
+    print("\nAnalyse terminée.")
+    print(f"Résultats : {OUTPUT_CSV.resolve()}")
+
+    if SUMMARY_CSV.exists():
+        print(f"Résumé    : {SUMMARY_CSV.resolve()}")
+
+    print("\nRépartition :")
+    print(dataframe["sentiment"].value_counts(dropna=False).to_string())
+
+
+if __name__ == "__main__":
+    main()

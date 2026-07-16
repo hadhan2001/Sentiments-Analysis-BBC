@@ -23,7 +23,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 
 CATEGORY_URLS = [
     "https://www.bbc.com/persian/afghanistan",
-    "https://www.bbc.com/persian/topics/c7q68p5epzzt",
+    "https://www.bbc.com/persian/articles/c70yprq79ezo",
 ]
 
 MAX_PAGES = 10 #Récupere les 10 premières pages

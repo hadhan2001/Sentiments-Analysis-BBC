@@ -1,0 +1,9 @@
+selenium>=4.20
+beautifulsoup4>=4.12
+lxml>=5.0
+pandas>=2.2
+torch>=2.2
+transformers>=4.48,<5
+sentencepiece>=0.2
+protobuf>=4.25
+reportlab>=4.0
